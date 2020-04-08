@@ -151,3 +151,234 @@ for i, img in enumerate(X):
     plt.colorbar()
     plt.imshow(y[i][:,1].reshape((PANNEL_SIZE, PANNEL_SIZE)))
 
+"""### Plot Y-Data Distribution"""
+
+freq0 = np.sum(labels==0)
+freq1 = np.sum(labels==1)
+
+print(freq0, freq1)
+
+sns.distplot(labels.flatten(), kde=False, hist_kws={'log':True})
+
+"""### Make Class Weights"""
+
+sample_weights = np.zeros((6, PANNEL_SIZE * PANNEL_SIZE, 2))
+
+sample_weights[:,:,0] = 1. / freq0
+sample_weights[:,:,1] = 1.
+
+plt.subplot(1,2,1)
+plt.imshow(sample_weights[0,:,0].reshape((224, 224)))
+plt.colorbar()
+plt.subplot(1,2,2)
+plt.imshow(sample_weights[0,:,1].reshape((224, 224)))
+plt.colorbar()
+
+"""### Create Model"""
+
+inputs = layers.Input(shape=(PANNEL_SIZE, PANNEL_SIZE, 3))
+
+net = layers.Conv2D(64, kernel_size=3, padding='same')(inputs)
+# net = layers.Activation('relu')(net)
+net = layers.LeakyReLU()(net)
+net = layers.MaxPool2D(pool_size=2)(net)
+
+shortcut_1 = net
+
+net = layers.Conv2D(128, kernel_size=3, padding='same')(net)
+# net = layers.Activation('relu')(net)
+net = layers.LeakyReLU()(net)
+net = layers.MaxPool2D(pool_size=2)(net)
+
+shortcut_2 = net
+
+net = layers.Conv2D(256, kernel_size=3, padding='same')(net)
+# net = layers.Activation('relu')(net)
+net = layers.LeakyReLU()(net)
+net = layers.MaxPool2D(pool_size=2)(net)
+
+shortcut_3 = net
+
+net = layers.Conv2D(256, kernel_size=1, padding='same')(net)
+# net = layers.Activation('relu')(net)
+net = layers.LeakyReLU()(net)
+net = layers.MaxPool2D(pool_size=2)(net)
+
+net = layers.UpSampling2D(size=2)(net)
+net = layers.Conv2D(256, kernel_size=3, padding='same')(net)
+net = layers.Activation('relu')(net)
+
+net = layers.Add()([net, shortcut_3])
+
+net = layers.UpSampling2D(size=2)(net)
+net = layers.Conv2D(128, kernel_size=3, padding='same')(net)
+net = layers.Activation('relu')(net)
+
+net = layers.Add()([net, shortcut_2])
+
+net = layers.UpSampling2D(size=2)(net)
+net = layers.Conv2D(64, kernel_size=3, padding='same')(net)
+net = layers.Activation('relu')(net)
+
+net = layers.Add()([net, shortcut_1])
+
+net = layers.UpSampling2D(size=2)(net)
+net = layers.Conv2D(2, kernel_size=1, padding='same')(net)
+
+net = layers.Reshape((-1, 2))(net)
+net = layers.Activation('softmax')(net)
+
+model = Model(inputs=inputs, outputs=net)
+
+model.compile(
+    loss='categorical_crossentropy', 
+    optimizer=optimizers.Adam(), 
+    metrics=['acc'], 
+    sample_weight_mode='temporal'
+)
+
+model.summary()
+
+"""### Training"""
+
+gen_mix = seg_gen_mix(waldo_sub_imgs, waldo_sub_labels, imgs, labels, tot_bs=6, prop=0.34, out_sz=(PANNEL_SIZE, PANNEL_SIZE))
+
+def on_epoch_end(epoch, logs):
+    print('\r', 'Epoch:%5d - loss: %.4f - acc: %.4f' % (epoch, logs['loss'], logs['acc']), end='')
+
+print_callback = LambdaCallback(on_epoch_end=on_epoch_end)
+
+history = model.fit_generator(
+    gen_mix, steps_per_epoch=6, epochs=500, 
+    class_weight=sample_weights,
+    verbose=0,
+    callbacks=[
+        print_callback,
+        ReduceLROnPlateau(monitor='loss', factor=0.2, patience=100, verbose=1, mode='auto', min_lr=1e-05)
+    ]
+)
+
+model.save('model.h5')
+
+plt.figure(figsize=(12, 4))
+plt.subplot(1, 2, 1)
+plt.title('loss')
+plt.plot(history.history['loss'])
+plt.subplot(1, 2, 2)
+plt.title('accuracy')
+plt.plot(history.history['acc'])
+
+"""### Evaluation"""
+
+img_filename = '02.jpg'
+test_img = np.array(Image.open(os.path.join('test_imgs', img_filename)).resize((2800, 1760), Image.NEAREST)).astype(np.float32) / 255.
+
+plt.figure(figsize=(20, 10))
+plt.imshow(test_img)
+
+"""### Helper Functions (Resize, Split, Combine Pannels)"""
+
+def img_resize(img):
+    h, w, _ = img.shape
+    nvpanels = int(h/PANNEL_SIZE)
+    nhpanels = int(w/PANNEL_SIZE)
+    new_h, new_w = h, w
+    if nvpanels*PANNEL_SIZE != h:
+        new_h = (nvpanels+1)*PANNEL_SIZE
+    if nhpanels*PANNEL_SIZE != w:
+        new_w = (nhpanels+1)*PANNEL_SIZE
+    if new_h == h and new_w == w:
+        return img
+    else:
+        return resize(img, output_shape=(new_h, new_w), preserve_range=True)
+
+def split_panels(img):
+    h, w, _ = img.shape
+    num_vert_panels = int(h/PANNEL_SIZE)
+    num_hor_panels = int(w/PANNEL_SIZE)
+    panels = []
+    for i in range(num_vert_panels):
+        for j in range(num_hor_panels):
+            panels.append(img[i*PANNEL_SIZE:(i+1)*PANNEL_SIZE,j*PANNEL_SIZE:(j+1)*PANNEL_SIZE])
+    return np.stack(panels)
+
+def combine_panels(img, panels):
+    h, w, _ = img.shape
+    num_vert_panels = int(h/PANNEL_SIZE)
+    num_hor_panels = int(w/PANNEL_SIZE)
+    total = []
+    p = 0
+    for i in range(num_vert_panels):
+        row = []
+        for j in range(num_hor_panels):
+            row.append(panels[p])
+            p += 1
+        total.append(np.concatenate(row, axis=1))
+    return np.concatenate(total, axis=0)
+
+"""### Preprocess Image"""
+
+test_img = img_resize(test_img)
+
+panels = split_panels(test_img)
+
+out = combine_panels(test_img, panels)
+
+print(panels.shape, test_img.shape, out.shape)
+
+"""### Predict"""
+
+model = load_model('model.h5')
+
+pred_panels = model.predict(panels).reshape((-1, PANNEL_SIZE, PANNEL_SIZE, 2))[:, :, :, 1]
+
+pred_out = combine_panels(test_img, pred_panels)
+
+# compute coordinates and confidence
+argmax_x = np.argmax(np.max(pred_out, axis=0), axis=0)
+argmax_y = np.argmax(np.max(pred_out, axis=1), axis=0)
+confidence = np.amax(pred_out) * 100
+
+print('(%s, %s) %.2f%%' % (argmax_x, argmax_y, confidence))
+
+plt.figure(figsize=(20, 10))
+plt.imshow(pred_out)
+plt.colorbar()
+
+"""### Make Overlay for Result"""
+
+def bbox_from_mask(img):
+    rows = np.any(img, axis=1)
+    cols = np.any(img, axis=0)
+    y1, y2 = np.where(rows)[0][[0, -1]]
+    x1, x2 = np.where(cols)[0][[0, -1]]
+    return x1, y1, x2, y2
+
+x1, y1, x2, y2 = bbox_from_mask((pred_out > 0.8).astype(np.uint8))
+print(x1, y1, x2, y2)
+
+# make overlay
+overlay = np.repeat(np.expand_dims(np.zeros_like(pred_out, dtype=np.uint8), axis=-1), 3, axis=-1)
+alpha = np.expand_dims(np.full_like(pred_out, 255, dtype=np.uint8), axis=-1)
+
+overlay = np.concatenate([overlay, alpha], axis=-1)
+
+overlay[y1:y2, x1:x2, 3] = 0
+
+plt.figure(figsize=(20, 10))
+plt.imshow(overlay)
+
+"""### Final Result"""
+
+fig, ax = plt.subplots(figsize=(20, 10))
+
+ax.imshow(test_img)
+ax.imshow(overlay, alpha=0.5)
+
+rect = patches.Rectangle((x1, y1), width=x2-x1, height=y2-y1, linewidth=1.5, edgecolor='r', facecolor='none')
+ax.add_patch(rect)
+
+ax.set_axis_off()
+
+fig.savefig(os.path.join('test_result', img_filename), bbox_inches='tight')
+
